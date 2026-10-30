@@ -42,6 +42,7 @@ from vllm_ascend.ops.rope_dsv4 import (
     get_full_cos_and_sin_dsa_for_layer,
 )
 from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
+from vllm_ascend.ops.triton.v41_slot_mapping import build_v41_slot_mapping
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
@@ -1077,6 +1078,15 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                         coordinates_output=self._slot_mapping_2d[:num_input_tokens],
                         flat_output=self._flat_slot_mapping[:num_input_tokens],
                     )
+                elif active_slots.device.type == "npu":
+                    prepared_slots, prepared_flat_slots = build_v41_slot_mapping(
+                        active_slots, positions, common.query_start_loc,
+                        num_input_tokens, num_actual_reqs, num_actual_tokens,
+                        storage_block_size, ratio if compressed else 1,
+                        kwargs.get("skip_ring_state_update", False),
+                        self._slot_mapping_2d[:num_input_tokens],
+                        self._flat_slot_mapping[:num_input_tokens],
+                    )
                 else:
                     if compressed and ratio != 1:
                         active_slots = compressed_slot_mapping(active_slots, ratio)
@@ -1178,30 +1188,27 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 ).view(num_reqs, blocks_per_req)
         noncausal = not bool(getattr(common, "causal", True))
         if noncausal and ori_sparse_indices is None:
-            ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
-                common.block_table_tensor[:num_reqs],
-                self.vllm_config.speculative_config.num_speculative_tokens,
-                window_size,
-                storage_block_size,
-                common.query_start_loc[: num_reqs + 1],
-                seq_lens,
-                num_actual_tokens,
-                use_logical_indices=True,
-            )
-            # Full draft graphs retain these addresses from capture. Rebuild
-            # the values in persistent buffers rather than returning temporary
-            # tensors whose capture-time contents never advance with decoding.
+            # Allocate once before capture, then write directly to these views.
+            spec_tokens = self.vllm_config.speculative_config.num_speculative_tokens
+            width = ((int(window_size) + int(spec_tokens) + 127) // 128) * 128
             if self._dspark_swa_indices is None:
-                self._dspark_swa_indices = ori_sparse_indices.new_empty(
-                    (self._max_tokens, *ori_sparse_indices.shape[1:])
+                self._dspark_swa_indices = torch.empty(
+                    (self._max_tokens, 1, width), dtype=torch.int32, device=seq_lens.device
                 )
-                self._dspark_swa_lengths = ori_topk_length.new_empty((self._max_tokens, *ori_topk_length.shape[1:]))
-            indices_view = self._dspark_swa_indices[:num_actual_tokens]
+                self._dspark_swa_lengths = torch.empty(
+                    (self._max_tokens, 1), dtype=torch.int32, device=seq_lens.device
+                )
+            if num_actual_tokens > self._max_tokens or self._dspark_swa_indices.shape[-1] != width:
+                raise ValueError("DSpark metadata capacity changed; rebuild before graph capture")
             assert self._dspark_swa_lengths is not None
-            lengths_view = self._dspark_swa_lengths[:num_actual_tokens]
-            indices_view.copy_(ori_sparse_indices)
-            lengths_view.copy_(ori_topk_length)
-            ori_sparse_indices, ori_topk_length = indices_view, lengths_view
+            ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
+                common.block_table_tensor[:num_reqs], spec_tokens, window_size,
+                storage_block_size, common.query_start_loc[:num_reqs + 1], seq_lens,
+                num_actual_tokens, index_width=width,
+                indices_output=self._dspark_swa_indices[:num_actual_tokens],
+                use_logical_indices=True,
+                lengths_output=self._dspark_swa_lengths[:num_actual_tokens],
+            )
         if (
             not noncausal
             and ori_sparse_indices is None
