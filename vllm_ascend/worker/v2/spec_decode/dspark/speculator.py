@@ -55,7 +55,14 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 )
 
 
-class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
+from vllm_ascend.worker.v2.spec_decode.dspark.hccl_sharded_loop import (
+    HcclDSparkShardedLoopMixin,
+)
+
+
+class AscendDSparkSpeculator(
+    HcclDSparkShardedLoopMixin, LmheadTPDraftSamplingMixin, DSparkSpeculator
+):
     _speculator_name = "DSpark"
     # DSpark samples via compute_draft_logits and never calls sample_draft, so
     # the mixin sample_draft alignment is not used; instead load_draft_model

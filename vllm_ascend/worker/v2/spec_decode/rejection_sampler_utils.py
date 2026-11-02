@@ -19,6 +19,7 @@
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache, draft_logits_row
 from vllm.v1.worker.gpu.sample.gumbel import _TL_RAND_MIN
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_cumulative_log_p_kernel,
@@ -72,6 +73,7 @@ def _probabilistic_rejection_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     # [num_logits, num_blocks]
     draft_local_max_ptr,
     draft_local_max_stride,
@@ -111,6 +113,7 @@ def _probabilistic_rejection_kernel(
     # offsets in int32, which overflows when num_logits exceeds INT32_MAX
     # (upstream vllm #46560).
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
+    cache_row = tl.maximum(draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr), 0)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_tokens = end_idx - start_idx
@@ -229,7 +232,7 @@ def _probabilistic_rejection_kernel(
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
-                        + req_state_idx * draft_logits_stride_0
+                        + cache_row * draft_logits_stride_0
                         + i * draft_logits_stride_1
                         + draft_sampled
                     ).to(tl.float32)
@@ -306,7 +309,7 @@ def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
     # [max_num_reqs, num_speculative_steps, V]
-    draft_logits: torch.Tensor | None,
+    draft_logits: DraftLogitsCache | torch.Tensor | None,
     # [num_logits]
     draft_sampled: torch.Tensor,
     # [num_reqs + 1]
@@ -344,6 +347,12 @@ def rejection_sample(
     posterior_threshold: float = 0.95,
     posterior_alpha: float = 0.4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # vLLM #64356 passes the cache object; old direct tensor callers remain replicated.
+    draft_logits_row_mapping = None
+    if isinstance(draft_logits, DraftLogitsCache):
+        draft_logits_row_mapping = draft_logits.row_mapping
+        draft_logits = draft_logits.values
+
     # Upstream passes logits after applying sampling parameters. Resolve the
     # worker configuration here to keep its sampler and chunking flow unchanged.
     # An explicit flag bypasses configuration lookup for standalone callers.
@@ -424,6 +433,7 @@ def rejection_sample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         expanded_idx_mapping,
         expanded_local_pos,
         temperature,
@@ -472,6 +482,7 @@ def rejection_sample(
             draft_logits,
             draft_logits.stride(0),
             draft_logits.stride(1),
+            draft_logits_row_mapping,
             draft_local_max,
             draft_local_max.stride(0),
             draft_local_sumexp,
@@ -500,6 +511,7 @@ def rejection_sample(
                     draft_logits,
                     draft_logits.stride(0),
                     draft_logits.stride(1),
+                    draft_logits_row_mapping,
                     draft_local_max,
                     draft_local_max.stride(0),
                     draft_local_sumexp,
@@ -544,6 +556,7 @@ def rejection_sample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_local_max,
         draft_local_max.stride(0),
         draft_local_sumexp,
@@ -584,6 +597,7 @@ def rejection_sample(
         seed,
         pos,
         has_draft_logits=has_draft_logits,
+        draft_logits_row_mapping=draft_logits_row_mapping,
         cumulative_log_p=cumulative_log_p,
         use_block_verification=use_block_verification,
     )

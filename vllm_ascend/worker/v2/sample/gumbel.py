@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.draft_logits import draft_logits_row
 
 
 @triton.jit(do_not_specialize=["logits_stride", "vocab_size"])
@@ -98,6 +99,7 @@ def _gumbel_sample_kernel(
     logits_cache_stride_0,
     logits_cache_stride_1,
     logits_cache_col_ptr,
+    logits_cache_row_mapping_ptr,
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
@@ -115,6 +117,7 @@ def _gumbel_sample_kernel(
 
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
+    cache_row = draft_logits_row(req_state_idx, logits_cache_row_mapping_ptr)
     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(tl.float32)
 
     for block_idx in range(num_blocks):
@@ -138,9 +141,9 @@ def _gumbel_sample_kernel(
             else:
                 col = 0
             tl.store(
-                logits_cache_ptr + req_state_idx * logits_cache_stride_0 + col * logits_cache_stride_1 + block,
+                logits_cache_ptr + tl.maximum(cache_row, 0) * logits_cache_stride_0 + col * logits_cache_stride_1 + block,
                 logits,
-                mask=mask & is_valid_req,
+                mask=mask & is_valid_req & (cache_row >= 0),
             )
 
         if temp != 0.0 and APPLY_TEMPERATURE:
@@ -184,6 +187,7 @@ def _gumbel_sample(
     logits_cache: torch.Tensor | None = None,  # [max_num_reqs, num_cols, vocab_size]
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
+    logits_cache_row_mapping: torch.Tensor | None = None,
     *,
     is_drafting: bool = False,
 ) -> torch.Tensor:
@@ -223,6 +227,7 @@ def _gumbel_sample(
         logits_cache.stride(0) if logits_cache is not None else 0,
         logits_cache.stride(1) if logits_cache is not None else 0,
         logits_cache_col,
+        logits_cache_row_mapping,
         logits,
         logits.stride(0),
         expanded_idx_mapping,
@@ -256,6 +261,7 @@ def _gumbel_sample_main(
     logits_cache: torch.Tensor | None = None,
     logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
+    logits_cache_row_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _gumbel_sample(
         logits,
@@ -267,6 +273,7 @@ def _gumbel_sample_main(
         logits_cache,
         logits_cache_col,
         use_fp64,
+        logits_cache_row_mapping=logits_cache_row_mapping,
         is_drafting=is_drafting,
     )
 

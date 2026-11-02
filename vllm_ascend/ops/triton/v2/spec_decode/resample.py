@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.draft_logits import draft_logits_row
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
@@ -45,6 +46,7 @@ def _resample_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     draft_rejected_logsumexp_ptr,
     rejected_step_ptr,
     cu_num_logits_ptr,
@@ -117,7 +119,7 @@ def _resample_kernel(
                 if HAS_DRAFT_LOGITS:
                     draft_block_logits = tl.load(
                         draft_logits_ptr
-                        + req_state_idx * draft_logits_stride_0
+                        + tl.maximum(draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr), 0) * draft_logits_stride_0
                         + resample_idx * draft_logits_stride_1
                         + vocab_offsets,
                         mask=vocab_mask,
@@ -172,6 +174,7 @@ def _categorical_finalize_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     draft_rejected_logsumexp_ptr,
     rejected_step_ptr,
     cu_num_logits_ptr,
@@ -307,7 +310,7 @@ def _categorical_finalize_kernel(
 
     if HAS_DRAFT_LOGITS:
         draft_block_logits = tl.load(
-            draft_logits_ptr + req_state_idx * draft_logits_stride_0 + resample_idx * draft_logits_stride_1 + token_ids,
+            draft_logits_ptr + tl.maximum(draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr), 0) * draft_logits_stride_0 + resample_idx * draft_logits_stride_1 + token_ids,
             mask=valid_token_mask & is_random_residual & has_total_mass,
             other=float("-inf"),
         ).to(tl.float32)
@@ -361,6 +364,7 @@ def resample(
     has_draft_logits: bool | None = None,
     cumulative_log_p: torch.Tensor | None = None,
     use_block_verification: bool = False,
+    draft_logits_row_mapping: torch.Tensor | None = None,
 ) -> None:
     """Resample the first rejected token or the bonus token in place.
 
@@ -430,6 +434,7 @@ def resample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_rejected_logsumexp,
         num_sampled,
         cu_num_logits,
@@ -462,6 +467,7 @@ def resample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_rejected_logsumexp,
         num_sampled,
         cu_num_logits,

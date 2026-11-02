@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.draft_logits import draft_logits_row
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
@@ -55,6 +56,7 @@ def _categorical_prepare_mass_kernel(
     logits_cache_stride_0,
     logits_cache_stride_1,
     logits_cache_col_ptr,
+    logits_cache_row_mapping_ptr,
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
@@ -87,6 +89,7 @@ def _categorical_prepare_mass_kernel(
         is_valid_req = req_state_idx >= 0
         temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(tl.float32)
 
+        cache_row = draft_logits_row(req_state_idx, logits_cache_row_mapping_ptr)
         offsets = block_idx * COARSE_BLOCK_SIZE + lanes
         mask = offsets < vocab_size
         logits = tl.load(logits_ptr + token_idx * logits_stride + offsets, mask=mask, other=float("-inf")).to(
@@ -102,9 +105,9 @@ def _categorical_prepare_mass_kernel(
             else:
                 col = 0
             tl.store(
-                logits_cache_ptr + req_state_idx * logits_cache_stride_0 + col * logits_cache_stride_1 + offsets,
+                logits_cache_ptr + tl.maximum(cache_row, 0) * logits_cache_stride_0 + col * logits_cache_stride_1 + offsets,
                 logits,
-                mask=mask & is_valid_req,
+                mask=mask & is_valid_req & (cache_row >= 0),
             )
 
         if temp != 0.0 and APPLY_TEMPERATURE:
@@ -310,6 +313,7 @@ def _categorical_sample(
     logits_cache: torch.Tensor | None = None,
     logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
+    logits_cache_row_mapping: torch.Tensor | None = None,
     *,
     is_drafting: bool = False,
 ) -> torch.Tensor:
@@ -363,6 +367,7 @@ def _categorical_sample(
         logits_cache.stride(0) if logits_cache is not None else 0,
         logits_cache.stride(1) if logits_cache is not None else 0,
         logits_cache_col,
+        logits_cache_row_mapping,
         logits,
         logits.stride(0),
         expanded_idx_mapping,
@@ -422,6 +427,7 @@ def _categorical_sample_main(
     logits_cache: torch.Tensor | None = None,
     logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
+    logits_cache_row_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _categorical_sample(
         logits,
@@ -433,6 +439,7 @@ def _categorical_sample_main(
         logits_cache,
         logits_cache_col,
         use_fp64,
+        logits_cache_row_mapping=logits_cache_row_mapping,
         is_drafting=is_drafting,
     )
 
