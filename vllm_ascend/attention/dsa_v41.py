@@ -42,6 +42,7 @@ from vllm_ascend.ops.rope_dsv4 import (
     get_full_cos_and_sin_dsa_for_layer,
 )
 from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
+from vllm_ascend.ops.triton.v41_slot_mapping import build_v41_slot_mapping
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
@@ -1076,6 +1077,20 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                         skip_update=kwargs.get("skip_ring_state_update", False),
                         coordinates_output=self._slot_mapping_2d[:num_input_tokens],
                         flat_output=self._flat_slot_mapping[:num_input_tokens],
+                    )
+                elif active_slots.device.type == "npu":
+                    prepared_slots, prepared_flat_slots = build_v41_slot_mapping(
+                        active_slots,
+                        positions,
+                        common.query_start_loc,
+                        num_input_tokens,
+                        num_actual_reqs,
+                        num_actual_tokens,
+                        storage_block_size,
+                        ratio if compressed else 1,
+                        kwargs.get("skip_ring_state_update", False),
+                        self._slot_mapping_2d[:num_input_tokens],
+                        self._flat_slot_mapping[:num_input_tokens],
                     )
                 else:
                     if compressed and ratio != 1:
