@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -37,6 +37,12 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather
+from vllm_ascend.models.deepseek_v41.sp_input_projections import (
+    project_and_pack,
+    projection_layout,
+    unpack_projections,
+)
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -81,6 +87,49 @@ direct_register_custom_op(
     op_func=dsa_v41_forward,
     mutates_args=["output"],
     fake_impl=dsa_v41_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def _use_sp_projected_prefill(forward_context, swa_metadata, num_tokens):
+    return (
+        num_tokens >= 512
+        and forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and swa_metadata is not None
+        and swa_metadata.num_prefills > 0
+        and not torch.npu.is_current_stream_capturing()
+    )
+
+
+@eager_break_during_capture
+def dsa_v41_sp_forward(hidden_states: torch.Tensor, output: torch.Tensor, layer_name: str) -> None:
+    forward_context = get_forward_context()
+    attn = forward_context.no_compile_layers[layer_name]
+    metadata = forward_context.attn_metadata
+    swa_metadata = None if metadata is None else metadata[attn.v41_impl.swa_prefix]
+    # Keep this metadata-dependent decision inside the custom op, outside
+    # Dynamo. All TP ranks must choose the same collective sequence.
+    if not _use_sp_projected_prefill(forward_context, swa_metadata, output.shape[0]):
+        full_hidden = sp_all_gather(hidden_states)[: output.shape[0]]
+        attn.v41_impl.forward(attn, None, full_hidden, output)
+        return
+    packed = project_and_pack(attn, hidden_states)
+    packed = sp_all_gather(packed)[: output.shape[0]]
+    projected = unpack_projections(packed, projection_layout(attn))
+    # A compact carrier for row count/dtype/device; all consumers of hidden
+    # values in preprocessing now read projected_inputs explicitly.
+    attn.v41_impl.forward(attn, None, projected["q_a"], output, projected_inputs=projected)
+
+
+def dsa_v41_sp_forward_fake(hidden_states: torch.Tensor, output: torch.Tensor, layer_name: str) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="dsa_v41_sp_forward",
+    op_func=dsa_v41_sp_forward,
+    mutates_args=["output"],
+    fake_impl=dsa_v41_sp_forward_fake,
     dispatch_key="PrivateUse1",
 )
 
@@ -429,7 +478,7 @@ class AscendDSAV41Impl:
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
         return self._preprocess(attn, hidden_states, hidden_states, metadata, metadata)
 
-    def _preprocess(self, attn, query_hidden, cache_hidden, query_metadata, cache_metadata):
+    def _preprocess(self, attn, query_hidden, cache_hidden, query_metadata, cache_metadata, projected_inputs=None):
         query_hidden = query_hidden[: query_metadata.swa.num_actual_tokens]
         cache_hidden = cache_hidden[: cache_metadata.swa.num_actual_tokens]
         if not query_hidden.shape[0]:
@@ -437,7 +486,17 @@ class AscendDSAV41Impl:
             return None, None, None
         cos, sin = query_metadata.rope(attn.rotary_emb.layername, query_hidden.shape[0])
         kv_cos, kv_sin = cache_metadata.rope(attn.rotary_emb.layername, cache_hidden.shape[0])
-        if self.multistream_dsv4_dsa_overlap and cache_hidden.shape[0]:
+        if projected_inputs is not None:
+            # The projected-prefill branch replaces the old overlap schedule
+            # for this call only; fallback/decode retain multistream_preprocess.
+            assert query_metadata is cache_metadata
+            projected_inputs = {key: value[: query_hidden.shape[0]] for key, value in projected_inputs.items()}
+            qr = attn.q_norm(projected_inputs["q_a"])
+            q = attn.wq_b(qr).unflatten(-1, (-1, attn.head_dim))
+            kv = attn.kv_norm(projected_inputs["kv"]).view(-1, 1, attn.head_dim)
+            self._apply_rotary(attn, kv, kv_cos, kv_sin)
+            self._write_swa_cache(attn, cache_metadata.swa, kv.squeeze(1))
+        elif self.multistream_dsv4_dsa_overlap and cache_hidden.shape[0]:
             q, qr = self.multistream_preprocess(
                 attn,
                 query_hidden,
@@ -455,7 +514,13 @@ class AscendDSAV41Impl:
                 self._write_swa_cache(attn, cache_metadata.swa, kv)
         self._apply_rotary(attn, q, cos, sin)
         # Consume local Query RoPE before compression can reuse source tables.
-        prepared_indexer = self._prepare_indexer_inputs(attn, query_hidden, qr, cos, sin, query_metadata)
+        if projected_inputs is None:
+            prepared_indexer = self._prepare_indexer_inputs(attn, query_hidden, qr, cos, sin, query_metadata)
+        else:
+            prepared_indexer = self._prepare_indexer_inputs(
+                attn, query_hidden, qr, cos, sin, query_metadata,
+                projected_weights=projected_inputs.get("indexer_weights"),
+            )
         if self.role.is_kv_source and cache_hidden.shape[0]:
             self._write_compressed_source(
                 attn,
@@ -465,6 +530,7 @@ class AscendDSAV41Impl:
                 kv_sin,
                 cache_metadata,
                 prepared_indexer=prepared_indexer,
+                **({"projected_inputs": projected_inputs} if projected_inputs is not None else {}),
             )
         else:
             self._quantize_indexer_query(attn, prepared_indexer, query_metadata)
@@ -473,10 +539,14 @@ class AscendDSAV41Impl:
     def _indexer_hidden_states(self, hidden_states, metadata):
         return hidden_states[: metadata.swa.num_actual_tokens]
 
-    def _prepare_indexer_inputs(self, attn, hidden_states, qr, cos, sin, metadata):
+    def _prepare_indexer_inputs(self, attn, hidden_states, qr, cos, sin, metadata, projected_weights=None):
         if not self.role.has_long_context or not self.role.is_index_source:
             return None
         indexer = attn.indexer
+        if projected_weights is not None:
+            query = indexer.project_query(qr)
+            indexer.apply_query_rope(query, cos, sin)
+            return DeepseekV41PreparedIndexer(query=query, weights=projected_weights)
         main_stream = torch.npu.current_stream()
         aux_stream = dsv4_dsa_overlap_stream()
 
@@ -586,6 +656,7 @@ class AscendDSAV41Impl:
         metadata,
         *,
         prepared_indexer=None,
+        projected_inputs=None,
     ):
         compressor = attn.compressor
         compressor_metadata = metadata.compressor
@@ -593,7 +664,10 @@ class AscendDSAV41Impl:
         ratio = self.role.compress_ratio
         if ratio == 1:
             self._quantize_indexer_query(attn, prepared_indexer, metadata)
-            latent = compressor(hidden_states)
+            latent = (
+                compressor(hidden_states) if projected_inputs is None
+                else compressor.norm(projected_inputs["compressor_kv"])
+            )
             # C1 source positions are the current token positions. Reuse the
             # query RoPE selected by the SWA metadata builder instead of
             # indexing the global table a second time.
@@ -605,12 +679,16 @@ class AscendDSAV41Impl:
             state_metadata = compressor_metadata.state
             if state_metadata.c2_metadata_group_id is not None:
                 wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
-            hidden_states_fp32 = hidden_states.float()
+            hidden_states_fp32 = hidden_states.float() if projected_inputs is None else None
             # Finish the input cast before query quantization starts on the
             # auxiliary stream, so the WKV matmul can overlap that quantization.
             self._quantize_indexer_query(attn, prepared_indexer, metadata)
-            kv = compressor.wkv(hidden_states_fp32)
-            score = compressor.wgate(hidden_states_fp32)
+            if projected_inputs is None:
+                kv = compressor.wkv(hidden_states_fp32)
+                score = compressor.wgate(hidden_states_fp32)
+            else:
+                kv = projected_inputs["compressor_kv"]
+                score = projected_inputs["compressor_score"]
             latent = compressor.pool_projected(kv, score, state_metadata)
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
@@ -777,7 +855,7 @@ class AscendDSAV41Impl:
         """V4.1 owns stable metadata buffers; no backend pointer patch is needed."""
         return None
 
-    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None):
+    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None, *, projected_inputs=None):
         # The custom-op caller provides a graph-stable output buffer.  Write
         # O-projection results into it directly instead of materializing a
         # second full hidden-state tensor and copying it at the graph boundary.
@@ -803,9 +881,14 @@ class AscendDSAV41Impl:
                 projector._forward_o_proj(o_proj_input, output)
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
-        q, qr, prepared_indexer = self._prepare_inputs_and_caches(
-            attn, hidden_states, metadata, forward_context.attn_metadata
-        )
+        if projected_inputs is None:
+            q, qr, prepared_indexer = self._prepare_inputs_and_caches(
+                attn, hidden_states, metadata, forward_context.attn_metadata
+            )
+        else:
+            q, qr, prepared_indexer = self._preprocess(
+                attn, hidden_states, hidden_states, metadata, metadata, projected_inputs=projected_inputs
+            )
         num_tokens = metadata.swa.num_actual_tokens
         if num_tokens:
             positions = metadata.positions[:num_tokens]

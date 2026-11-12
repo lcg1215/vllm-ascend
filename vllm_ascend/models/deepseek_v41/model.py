@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -94,6 +95,7 @@ from .engram.embedding import (
     engram_storage_dtype,
     preflight_engram_checkpoint,
 )
+from .sp_input_projections import local_projection_rejection_reason
 from .engram.layer import AscendEngram
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .indexer import DeepseekV41Indexer
@@ -603,6 +605,7 @@ class DeepseekV41SWAAttention(nn.Module):
         super().__init__()
         self.layer_idx = int(prefix.split(".")[-2])
         init_attention_projections(self, config, quant_config, prefix, reduce_results)
+        self.sequence_parallel_input = False
         self.compress_ratio = 0
         self.compressor = None
         self.indexer = None
@@ -671,6 +674,9 @@ class DeepseekV41SWAAttention(nn.Module):
             # prefix=f'{prefix}.attn',
             prefix=f"{prefix}",
         )
+
+    def use_sequence_parallel_input(self, num_tokens):
+        return self.sequence_parallel_input and num_tokens >= 512
 
 
 class DeepseekV41Attention(DeepseekV41SWAAttention):
@@ -758,8 +764,12 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         context[self.v41_layer_name] = self
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        output = torch.empty_like(hidden_states)
-        torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
+        if self.use_sequence_parallel_input(positions.shape[0]):
+            output = hidden_states.new_empty((positions.shape[0], self.dim))
+            torch.ops.vllm.dsa_v41_sp_forward(hidden_states, output, self.v41_layer_name)
+        else:
+            output = torch.empty_like(hidden_states)
+            torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
         return output
 
     def write_kv(self, hidden_states):
@@ -837,6 +847,37 @@ class DeepseekV41DecoderLayer(nn.Module):
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
             self.self_attn.wo_b.reduce_results = False
+        # Opt-in prefill prototype. Runtime dispatch remains inside the custom
+        # op; graph/decode batches gather hidden states and use the old backend.
+        self.self_attn.sequence_parallel_input = (
+            os.getenv("VLLM_ASCEND_DSV41_SP_INPUT_PROJECTIONS", "0") == "1"
+            and self.use_sequence_parallel
+            and get_tensor_model_parallel_world_size() > 1
+            and not is_draft_layer
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and vllm_config.lora_config is None
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+            and parallel_config.decode_context_parallel_size == 1
+            and not parallel_config.use_ubatching
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+        if self.self_attn.sequence_parallel_input:
+            reason = local_projection_rejection_reason(self.self_attn)
+            if reason is not None:
+                self.self_attn.sequence_parallel_input = False
+                from vllm.logger import logger
+
+                logger.warning("DSV41 SP input projections disabled for %s: %s", prefix, reason)
+        if layer_idx == 0 and not is_draft_layer:
+            from vllm.logger import logger
+
+            logger.info(
+                "DSV41 SP input projection prototype: requested=%s, SP=%s, layer0_enabled=%s",
+                os.getenv("VLLM_ASCEND_DSV41_SP_INPUT_PROJECTIONS", "0"),
+                self.use_sequence_parallel,
+                self.self_attn.sequence_parallel_input,
+            )
         has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.engram: AscendEngram | None
         if has_engram and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
@@ -911,7 +952,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             pre_mix,
         )
         x = self.input_layernorm(x)
-        if use_sequence_parallel:
+        if use_sequence_parallel and not self.self_attn.use_sequence_parallel_input(positions.shape[0]):
             x = sp_all_gather(x)[: positions.shape[0]]
         x = self.self_attn(positions, x, llama_4_scaling)
         if use_sequence_parallel:
