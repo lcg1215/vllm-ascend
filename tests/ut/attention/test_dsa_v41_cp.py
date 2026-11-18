@@ -908,6 +908,129 @@ def runtime(builders, monkeypatch):
     return make
 
 
+class TestPCPRankMajorCacheWrites:
+    @pytest.mark.parametrize(
+        "world,rank,scenario,decode_sharded",
+        [
+            (2, 0, "prefill", False),
+            (4, 3, "prefill", False),
+            (2, 1, "mixed", False),
+            (4, 0, "mixed", False),
+            (4, 0, "empty", False),
+            (4, 3, "empty", False),
+            (2, 0, "decode", True),
+            (4, 3, "decode", True),
+            (4, 3, "dummy", True),
+        ],
+    )
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("specialized", [False, True])
+    def test_swa_writer_consumes_gathered_storage(
+        self, builders, monkeypatch, world, rank, scenario, decode_sharded, packed, specialized
+    ):
+        batch = _batch(world, rank, scenario, decode_sharded=decode_sharded)
+        owners = builders(world, rank, decode_sharded=decode_sharded, specialized=specialized)
+        metadata = _build_planes(owners, batch)[PREFIXES["swa"]]
+        canonical = torch.arange(len(batch.positions) * 2, dtype=torch.float32).view(-1, 2) + 1
+        local_padded = batch.local.num_input_tokens
+        gathered = torch.full((world * local_padded, 2), 9999.0)
+        for peer, ids in enumerate(batch.rows):
+            gathered[peer * local_padded : peer * local_padded + len(ids)] = canonical[ids]
+        # Distinct values in later decode replicas catch accidental duplicate
+        # writes, even when ordinary projection would make them identical.
+        selected_rows = metadata.hidden_restore_idx[: len(batch.positions)]
+        selected = torch.zeros(gathered.shape[0], dtype=torch.bool)
+        selected[selected_rows] = True
+        gathered[~selected] = 9999.0
+
+        def gather(value, dim):
+            expected = torch.zeros(local_padded, 2)
+            expected[: len(batch.local_ids)] = canonical[batch.local_ids]
+            torch.testing.assert_close(value, expected)
+            assert dim == 0
+            return gathered
+
+        monkeypatch.setattr(dsa_v41_cp, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather))
+        cache = torch.full((256, 2), -777.0)
+        writes = []
+
+        def scatter(actual_cache, slots, values):
+            assert actual_cache is cache
+            assert values.data_ptr() == gathered.data_ptr()
+            assert values.shape == gathered.shape
+            valid = slots[:, 0] >= 0
+            flat = slots[valid, 0].long() * 8 + slots[valid, 1]
+            assert flat.unique().numel() == flat.numel()
+            actual_cache[flat] = values[valid]
+            writes.append(int(valid.sum()))
+
+        attn = SimpleNamespace(dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(kv_cache=[cache])))
+        if packed:
+
+            def write_attention_cache(actual_cache, slots, values, *, kind):
+                assert kind == "win"
+                coordinates = torch.stack((slots // 8, slots % 8), dim=-1).int()
+                coordinates[slots < 0] = -1
+                scatter(actual_cache, coordinates, values)
+
+            attn.packed_cache_ops = SimpleNamespace(write_attention_cache=write_attention_cache)
+        else:
+            monkeypatch.setattr(torch.ops._C_ascend, "npu_scatter_nd_update_sk", scatter, raising=False)
+        expected = cache.clone()
+        if scenario != "dummy":
+            expected[batch.slots] = canonical
+        # Fail if a future change silently reintroduces the wide restore.
+        monkeypatch.setattr(torch, "index_select", lambda *args, **kwargs: pytest.fail("SWA restored gathered KV"))
+        dsa_v41_cp.AscendDSAV41PCPImpl._write_swa_cache(attn, metadata, canonical[batch.local_ids])
+        torch.testing.assert_close(cache, expected)
+        assert writes == [0 if scenario == "dummy" else len(batch.positions)]
+        # The read-side metadata remains in scheduler order.
+        torch.testing.assert_close(metadata.global_metadata.positions[: len(batch.positions)], batch.positions)
+
+    def test_full_graph_slot_views_are_stable_and_clear_previous_rows(self, builders):
+        owners = builders(world=2, rank=0, decode_sharded=True, specialized=True)
+        addresses = None
+        for scenario in ("decode", "dummy", "decode"):
+            batch = _batch(2, 0, scenario, decode_sharded=True)
+            batch.graph = True
+            metadata = _build_planes(owners, batch)[PREFIXES["swa"]]
+            write_metadata = metadata.swa_cache_write_metadata
+            current = (write_metadata.slot_mapping.data_ptr(), write_metadata.flat_slot_mapping.data_ptr())
+            if addresses is None:
+                addresses = current
+            assert current == addresses
+            num_tokens = len(batch.positions)
+            assert torch.all(metadata.hidden_restore_idx[num_tokens:] == 0)
+            # Repeated graph-padding index 0 must never invalidate token 0.
+            expected = torch.full_like(write_metadata.flat_slot_mapping, -1)
+            if scenario != "dummy":
+                expected[metadata.hidden_restore_idx[:num_tokens]] = batch.slots
+            torch.testing.assert_close(write_metadata.flat_slot_mapping, expected)
+            slots = write_metadata.slot_mapping
+            actual_flat = torch.where(slots[:, 0] >= 0, slots[:, 0].long() * 8 + slots[:, 1], -1)
+            torch.testing.assert_close(actual_flat, expected)
+
+    def test_graph_padding_and_invalid_global_slots_preserve_first_token(self, builders):
+        builder = builders()["swa"]
+        global_slots = torch.tensor([[3, 2], [-1, -1], [5, 1], [-1, -1]], dtype=torch.int32)
+        global_flat_slots = torch.tensor([26, -1, 41, -1])
+        # Use a real metadata instance so dataclasses.replace exercises the
+        # write-only view without touching query metadata or global slots.
+        batch = _batch(2, 0, "prefill")
+        global_metadata = replace(
+            _build_planes({"swa": builder}, batch)[PREFIXES["swa"]].global_metadata,
+            slot_mapping=global_slots,
+            flat_slot_mapping=global_flat_slots,
+        )
+        context = SimpleNamespace(
+            global_batch=SimpleNamespace(num_tokens=3), hidden_restore_idx=torch.tensor([0, 4, 2, 0, 0, 0])
+        )
+        result = builder._build_swa_cache_write_metadata(global_metadata, context, 3)
+        torch.testing.assert_close(result.flat_slot_mapping, torch.tensor([26, -1, 41, -1, -1, -1]))
+        torch.testing.assert_close(result.slot_mapping[0], torch.tensor([3, 2], dtype=torch.int32))
+        torch.testing.assert_close(global_metadata.slot_mapping, global_slots)
+
+
 class TestPCPBatchLifecycle:
     @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize(

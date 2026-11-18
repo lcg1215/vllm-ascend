@@ -228,6 +228,8 @@ class AscendDSAV41PCPMetadata(AscendDSAV41Metadata):
     # Maps scheduler token order to the rank-major gathered layout.
     hidden_restore_idx: torch.Tensor
     c2_metadata: V41PCPC2Metadata
+    # Write-only view: slots follow the rank-major AllGather result.
+    swa_cache_write_metadata: AscendDSAV41Metadata | None = None
 
     @classmethod
     def from_local_metadata(
@@ -237,6 +239,7 @@ class AscendDSAV41PCPMetadata(AscendDSAV41Metadata):
         local_num_tokens_after_padding: int,
         hidden_restore_idx: torch.Tensor,
         c2_metadata: V41PCPC2Metadata,
+        swa_cache_write_metadata: AscendDSAV41Metadata | None = None,
     ) -> "AscendDSAV41PCPMetadata":
         values = {field.name: getattr(local, field.name) for field in fields(AscendDSAV41Metadata)}
         values["global_metadata"] = global_metadata
@@ -245,6 +248,7 @@ class AscendDSAV41PCPMetadata(AscendDSAV41Metadata):
             local_num_tokens_after_padding=local_num_tokens_after_padding,
             hidden_restore_idx=hidden_restore_idx,
             c2_metadata=c2_metadata,
+            swa_cache_write_metadata=swa_cache_write_metadata,
         )
 
 
@@ -263,6 +267,14 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         self._is_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         self._max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self._hidden_restore_idx_buffer = torch.empty(self._max_tokens, dtype=torch.int64, device=device)
+        # Only SWA consumes the rank-major write view. Keep both cache ABIs
+        # graph-stable without allocating another wide KV tensor per layer.
+        self._pcp_cache_slot_mapping = None
+        self._pcp_cache_flat_slot_mapping = None
+        if self._cache_kind == "swa":
+            gathered_capacity = self._pcp_world_size * self._max_tokens
+            self._pcp_cache_slot_mapping = torch.empty((gathered_capacity, 2), dtype=torch.int32, device=device)
+            self._pcp_cache_flat_slot_mapping = torch.empty(gathered_capacity, dtype=torch.int64, device=device)
 
         # DualChunkSwap doubles prefill rows; decode graphs also pad requests.
         max_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -422,6 +434,26 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
             pcp_context,
             hidden_restore_idx=hidden_restore_idx,
         )
+
+    def _build_swa_cache_write_metadata(self, global_metadata, pcp_context, num_local_padded_tokens):
+        """Move narrow slot controls into AllGather order, keeping KV in place."""
+        num_gathered_tokens = self._pcp_world_size * num_local_padded_tokens
+        assert self._pcp_cache_slot_mapping is not None
+        assert self._pcp_cache_flat_slot_mapping is not None
+        assert num_gathered_tokens <= self._pcp_cache_flat_slot_mapping.shape[0]
+        slots = self._pcp_cache_slot_mapping[:num_gathered_tokens]
+        flat_slots = self._pcp_cache_flat_slot_mapping[:num_gathered_tokens]
+        slots.fill_(-1)
+        flat_slots.fill_(-1)
+        # Graph padding repeats restore index 0; copying it would overwrite
+        # a real slot. Actual indices also pick one replica of decode rows.
+        num_actual_tokens = pcp_context.global_batch.num_tokens
+        restore_idx = pcp_context.hidden_restore_idx[:num_actual_tokens]
+        slots.index_copy_(0, restore_idx, global_metadata.slot_mapping[:num_actual_tokens])
+        flat_slots.index_copy_(0, restore_idx, global_metadata.flat_slot_mapping[:num_actual_tokens])
+        # This view is passed only to the cache writer, never to attention or
+        # compression, whose request coordinates remain in scheduler order.
+        return dataclasses.replace(global_metadata, slot_mapping=slots, flat_slot_mapping=flat_slots)
 
     def _build_local_common_attn_metadata(
         self,
@@ -598,8 +630,18 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
                 buffer_capacity=max(self._max_tokens, self._seq_lens.numel()),
             )
             shared["c2_metadata"] = c2_metadata
+        swa_cache_write_metadata = (
+            self._build_swa_cache_write_metadata(global_metadata, pcp_context, local_common.num_input_tokens)
+            if self._cache_kind == "swa"
+            else None
+        )
         return AscendDSAV41PCPMetadata.from_local_metadata(
-            local_metadata, global_metadata, local_common.num_input_tokens, pcp_context.hidden_restore_idx, c2_metadata
+            local_metadata,
+            global_metadata,
+            local_common.num_input_tokens,
+            pcp_context.hidden_restore_idx,
+            c2_metadata,
+            swa_cache_write_metadata,
         )
 
 
@@ -653,10 +695,14 @@ class AscendDSAV41PCPImpl(_ReplicatedCacheImpl):
         return prepared
 
     @staticmethod
-    def _gather_cache_rows(rows, metadata):
+    def _all_gather_cache_rows(rows, metadata):
         padded = rows.new_zeros((metadata.local_num_tokens_after_padding, *rows.shape[1:]))
         padded[: rows.shape[0]].copy_(rows)
-        gathered = get_pcp_group().all_gather(padded, dim=0)
+        return get_pcp_group().all_gather(padded, dim=0)
+
+    @staticmethod
+    def _gather_cache_rows(rows, metadata):
+        gathered = AscendDSAV41PCPImpl._all_gather_cache_rows(rows, metadata)
         return torch.index_select(gathered, 0, metadata.hidden_restore_idx)
 
     def _compress_local_c2(self, attn, hidden_states, local_metadata, global_metadata):
@@ -708,8 +754,9 @@ class AscendDSAV41PCPImpl(_ReplicatedCacheImpl):
     @staticmethod
     def _write_swa_cache(attn, metadata, value):
         if isinstance(metadata, AscendDSAV41PCPMetadata):
-            value = AscendDSAV41PCPImpl._gather_cache_rows(value, metadata)
-            metadata = metadata.global_metadata
+            value = AscendDSAV41PCPImpl._all_gather_cache_rows(value, metadata)
+            assert metadata.swa_cache_write_metadata is not None
+            metadata = metadata.swa_cache_write_metadata
         AscendDSAV41Impl._write_swa_cache(attn, metadata, value)
 
     def _compress_and_write_caches(
